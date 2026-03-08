@@ -33,14 +33,25 @@ ai-hist sync
 # Full-text search
 ai-hist search "authentication bug"
 ai-hist search "refactor" --source claude --limit 10
+ai-hist search "deploy" --project relay
 
 # Recent prompts
-ai-hist recent       # last 20
-ai-hist recent 50    # last 50
+ai-hist recent                             # last 20
+ai-hist recent 50                          # last 50
+ai-hist recent --source claude --project my-app
+
+# Drill into a specific entry (shows full prompt + metadata)
+ai-hist show 4521
+
+# View all prompts in a session
+ai-hist session abc-1234-def
+ai-hist session abc-1234-def --full   # no truncation
 
 # Stats overview
 ai-hist stats
 ```
+
+Search results include entry IDs (`#NNN`) you can pass to `show` or use to find the `session_id` for `session`.
 
 Example output from `ai-hist stats`:
 
