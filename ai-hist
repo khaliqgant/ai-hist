@@ -173,7 +173,8 @@ def cmd_sync(args=None):
 def cmd_search(args):
     """Full-text search across prompts."""
     conn = sqlite3.connect(str(DB_PATH))
-    query = " ".join(args.query)
+    # Quote each term so hyphens/special chars are treated as literals by FTS5
+    query = " ".join(f'"{t}"' for t in args.query)
 
     sql = (
         "SELECT h.source, h.project, h.prompt, h.timestamp_ms "

@@ -414,6 +414,16 @@ class TestCmdSearch:
         captured = capsys.readouterr()
         assert "authentication" in captured.out
 
+    def test_search_hyphenated_term(self, tmp_env, capsys):
+        seed_db(tmp_env, claude_lines=[
+            make_claude_entry("deploy agent-relay to prod", 1700000001000, "/proj"),
+        ])
+        capsys.readouterr()
+        args = SimpleNamespace(query=["agent-relay"], source=None, limit=20)
+        ai_hist.cmd_search(args)
+        captured = capsys.readouterr()
+        assert "agent-relay" in captured.out
+
 
 class TestCmdRecent:
     def test_recent_default(self, tmp_env, capsys):
