@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+ai-hist: Sync and search AI CLI conversation history in SQLite.
+
+Supports Claude Code and Codex CLI out of the box.
+Zero dependencies — Python 3.8+ standard library only.
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+# --- Configuration -----------------------------------------------------------
+
+DEFAULT_DB = os.path.join(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")), "ai-hist", "ai-history.db")
+DB_PATH = Path(os.environ.get("AI_HIST_DB", DEFAULT_DB))
+STATE_PATH = DB_PATH.parent / ".sync-state.json"
+
+SOURCES = {
+    "claude": Path.home() / ".claude" / "history.jsonl",
+    "codex": Path.home() / ".codex" / "history.jsonl",
+}
+
+# --- Schema ------------------------------------------------------------------
+
+SCHEMA = """\
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    session_id TEXT,
+    project TEXT,
+    prompt TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    UNIQUE(source, timestamp_ms, prompt)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+    prompt, project, content='history', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
+    INSERT INTO history_fts(rowid, prompt, project)
+    VALUES (new.id, new.prompt, new.project);
+END;
+"""
+
+# --- Parsers -----------------------------------------------------------------
+
+def parse_claude(line: str):
+    """Parse a Claude Code history.jsonl line."""
+    obj = json.loads(line)
+    display = obj.get("display", "").strip()
+    if not display:
+        return None
+    return {
+        "source": "claude",
+        "session_id": obj.get("sessionId"),
+        "project": obj.get("project"),
+        "prompt": display,
+        "timestamp_ms": obj.get("timestamp", 0),
+    }
+
+
+def parse_codex(line: str):
+    """Parse a Codex CLI history.jsonl line."""
+    obj = json.loads(line)
+    text = obj.get("text", "").strip()
+    if not text:
+        return None
+    return {
+        "source": "codex",
+        "session_id": obj.get("session_id"),
+        "project": None,
+        "prompt": text,
+        "timestamp_ms": int(obj.get("ts", 0) * 1000),
+    }
+
+
+PARSERS = {
+    "claude": parse_claude,
+    "codex": parse_codex,
+}
+
+# --- Core --------------------------------------------------------------------
+
+def init_db(conn: sqlite3.Connection):
+    conn.executescript(SCHEMA)
+    conn.execute("PRAGMA journal_mode=WAL")
+
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text())
+    return {}
+
+
+def save_state(state: dict):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def fmt_row(source, project, prompt, ts_ms):
+    """Format a single row for display."""
+    dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts_ms / 1000))
+    proj = f" [{project}]" if project else ""
+    display = prompt[:120] + "..." if len(prompt) > 120 else prompt
+    display = display.replace("\n", " ")
+    return f"  {dt}  ({source}){proj}  {display}"
+
+
+# --- Commands ----------------------------------------------------------------
+
+def cmd_sync(args=None):
+    """Import new entries from history files into SQLite."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    init_db(conn)
+    state = load_state()
+
+    for name, path in SOURCES.items():
+        if not path.exists():
+            print(f"  [{name}] not found: {path} (skipped)")
+            continue
+
+        file_size = path.stat().st_size
+        offset = state.get(name, 0)
+        if offset >= file_size:
+            print(f"  [{name}] up to date")
+            continue
+
+        print(f"  [{name}] syncing {file_size - offset:,} new bytes...")
+        parser = PARSERS[name]
+        inserted = 0
+        errors = 0
+
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = parser(line)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    errors += 1
+                    continue
+                if row is None:
+                    continue
+                try:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO history "
+                        "(source, session_id, project, prompt, timestamp_ms) "
+                        "VALUES (:source, :session_id, :project, :prompt, :timestamp_ms)",
+                        row,
+                    )
+                    if cur.rowcount > 0:
+                        inserted += 1
+                except sqlite3.Error:
+                    errors += 1
+
+        conn.commit()
+        state[name] = file_size
+        print(f"  [{name}] +{inserted:,} rows" + (f" ({errors} errors)" if errors else ""))
+
+    save_state(state)
+    total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+    conn.close()
+    print(f"  Total: {total:,} entries")
+
+
+def cmd_search(args):
+    """Full-text search across prompts."""
+    conn = sqlite3.connect(str(DB_PATH))
+    query = " ".join(args.query)
+
+    sql = (
+        "SELECT h.source, h.project, h.prompt, h.timestamp_ms "
+        "FROM history_fts f JOIN history h ON f.rowid = h.id "
+        "WHERE history_fts MATCH ? "
+    )
+    params: list = [query]
+    if args.source:
+        sql += "AND h.source = ? "
+        params.append(args.source)
+    sql += "ORDER BY h.timestamp_ms DESC LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No results.")
+        return
+    for row in rows:
+        print(fmt_row(*row))
+
+
+def cmd_recent(args):
+    """Show N most recent entries."""
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        "SELECT source, project, prompt, timestamp_ms "
+        "FROM history ORDER BY timestamp_ms DESC LIMIT ?",
+        (args.n,),
+    ).fetchall()
+    conn.close()
+    for row in rows:
+        print(fmt_row(*row))
+
+
+def cmd_stats(args=None):
+    """Show summary statistics."""
+    conn = sqlite3.connect(str(DB_PATH))
+
+    total = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+    print(f"\nTotal entries: {total:,}")
+
+    print("\nBy source:")
+    for source, count in conn.execute(
+        "SELECT source, COUNT(*) FROM history GROUP BY source ORDER BY source"
+    ):
+        print(f"  {source}: {count:,}")
+
+    r = conn.execute("SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history").fetchone()
+    if r[0]:
+        print(f"\nDate range:")
+        print(f"  {time.strftime('%Y-%m-%d', time.localtime(r[0] / 1000))} to "
+              f"{time.strftime('%Y-%m-%d', time.localtime(r[1] / 1000))}")
+
+    print("\nTop 10 projects:")
+    for project, count in conn.execute(
+        "SELECT project, COUNT(*) as c FROM history "
+        "WHERE project IS NOT NULL GROUP BY project ORDER BY c DESC LIMIT 10"
+    ):
+        print(f"  {count:>6,}  {project}")
+
+    conn.close()
+
+
+def cmd_watch(args):
+    """Continuous sync loop (for launchd/cron)."""
+    interval = args.interval
+    print(f"Watching every {interval}s (Ctrl-C to stop)...")
+    while True:
+        try:
+            cmd_sync()
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="ai-hist", description="Sync & search AI CLI history in SQLite.")
+    sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("sync", help="Import new entries from history files")
+
+    s = sub.add_parser("search", help="Full-text search prompts")
+    s.add_argument("query", nargs="+", help="Search terms")
+    s.add_argument("--source", choices=["claude", "codex"], help="Filter by source")
+    s.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+
+    r = sub.add_parser("recent", help="Show most recent entries")
+    r.add_argument("n", nargs="?", type=int, default=20, help="Number of entries (default: 20)")
+
+    sub.add_parser("stats", help="Show summary statistics")
+
+    w = sub.add_parser("watch", help="Continuous sync loop")
+    w.add_argument("--interval", type=int, default=60, help="Seconds between syncs (default: 60)")
+
+    args = p.parse_args()
+    cmds = {"sync": cmd_sync, "search": cmd_search, "recent": cmd_recent, "stats": cmd_stats, "watch": cmd_watch}
+
+    if args.command in cmds:
+        cmds[args.command](args)
+    else:
+        p.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+*.db
+*.db-wal
+*.db-shm
+.sync-state.json
+__pycache__/
+*.pyc
+/tmp/
