@@ -539,7 +539,7 @@ def cmd_show(args):
         if source == "claude" and project:
             print(f"  Resume:  cd {project} && claude --resume {session_id}")
         elif source == "codex" and session_id:
-            print(f"  Resume:  codex --resume {session_id}")
+            print(f"  Resume:  codex resume {session_id}")
         elif source == "cursor":
             cmd = f"cursor-agent --resume={session_id}"
             if project:

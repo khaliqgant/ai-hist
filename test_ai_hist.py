@@ -582,7 +582,7 @@ class TestCmdShow:
         args = SimpleNamespace(id=1)
         ai_hist.cmd_show(args)
         captured = capsys.readouterr()
-        assert "codex --resume cx-sess" in captured.out
+        assert "codex resume cx-sess" in captured.out
 
     def test_show_nonexistent_entry(self, tmp_env, capsys):
         seed_db(tmp_env)
